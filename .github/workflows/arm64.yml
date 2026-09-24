@@ -20,9 +20,12 @@
 name: build-windows-arm64
 
 on:
-  push:
-    branches: [ master ]
   workflow_dispatch:
+    inputs:
+      sha:
+        description: '粘贴要构建的 commit 完整 SHA（例如 a1b2c3def0123456789abc...）。此框为自由文本框，不是分支/标签下拉。'
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -32,10 +35,15 @@ jobs:
     name: build on windows-11-arm
     runs-on: windows-11-arm
     steps:
-      - name: Checkout
+      - name: Checkout (user-specified SHA)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.sha }}
           persist-credentials: false
+
+      - name: Show target SHA (debug)
+        shell: pwsh
+        run: echo "Building SHA: ${{ inputs.sha }}"
 
       - name: Show runner / Java arch (debug)
         shell: pwsh
