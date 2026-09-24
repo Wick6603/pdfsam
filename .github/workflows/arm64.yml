@@ -43,8 +43,7 @@ jobs:
 
       - name: Show target SHA (debug)
         shell: pwsh
-        run: echo "Building SHA: ${{ inputs.sha }}"
-
+        run: 'echo "Building SHA: ${{ inputs.sha }}"'   # ✅
       - name: Show runner / Java arch (debug)
         shell: pwsh
         run: |
