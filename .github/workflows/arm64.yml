@@ -1,21 +1,23 @@
 # =============================================================================
 # 在 Windows on ARM (windows-11-arm) 上原生构建 PDFsam Basic
 #
-# 策略（路径 B）：使用 BellSoft Liberica 的 "jdk+fx"（即 Full）构建，
-# 它已经内嵌了面向 Windows AArch64 的 LibericaFX（基于 OpenJFX）。
-# 这样可以绕过 "Maven Central 的 org.openjfx 没有 windows-aarch64 分类器"
-# 这一根本障碍——JavaFX 直接来自 JDK 自带的 jmods，而不是去中央仓库拉工件。
+# 策略（路径 B 落地版）：使用 BellSoft Liberica 的 "jdk+fx"（即 Full）构建，
+# 它内嵌了面向 Windows AArch64 的 LibericaFX（基于 OpenJFX，含 arm64 原生库）。
+#
+# ★ 关键坑（本次已解决）：pdfsam 把 OpenJFX 声明为 Maven 依赖，classifier 用
+#   ${javafx.platform} 这个属性；而官方 OpenJFX 在 Maven Central 没有 windows-arm64
+#   工件。所以只换 JDK 不够——必须把 JDK 自带的 javafx jar 装进本地仓库，并显式用
+#   -Djavafx.platform=windows-arm64 让 Maven 从本地解析。
 #
 # 参考：pdfsam 原仓库 .github/workflows/build.yml（同样用 liberica + jdk+fx）
 # Runner 标签来源：GitHub 官方文档 "GitHub-hosted runners" 参考表
 #   - windows-11-arm          （arm64 / Windows 11，公共仓库免费；私有走 arm64 standard runner）
-#   - windows-11-vs2026-arm   （同上，但预装 Visual Studio，适合"路径 A 从源码编译 OpenJFX"）
+#   - windows-11-vs2026-arm   （同上，但预装 Visual Studio；若改走"从源码编译 OpenJFX"路径 A 用这个）
 #
 # 关于 gettext：pdfsam 仅"构建期"需要它（gettext-maven-plugin 调 msgfmt 把
 #   pdfsam-i18n/po/*.po 编译成 Java Messages_*.properties 打进 JAR），运行期
 #   通过标准 Java ResourceBundle 读取，不依赖 gettext 二进制。mlocati 的预编译包
 #   只有 x86/x64，故下面 scoop 装的是 x64 版、靠 ARM64 上的 x64 模拟运行，构建足够。
-#   （若要原生 arm64 gettext，改用：vcpkg install gettext --triplet arm64-windows）
 # =============================================================================
 name: build-windows-arm64
 
@@ -51,15 +53,9 @@ jobs:
           echo "RUNNER_OS   = $env:RUNNER_OS"
           echo "RUNNER_ARCH = $env:RUNNER_ARCH"
           java -version
-          # 确认拿到的是 aarch64 的 JDK（应显示 os.arch = aarch64 / vendor = BellSoft）
           java -XshowSettings:properties -version 2>&1 | Select-String -Pattern 'os.arch|java.vm.vendor'
 
       - name: Set up JDK 25 (Liberica Full with JavaFX) for Windows ARM64
-        # 关键：distribution=liberica + java-package=jdk+fx 会让 setup-java
-        # 拉取 windows-aarch64 的 Full 构建，其中已含 javafx.* 模块（LibericaFX）。
-        # 若 setup-java 报找不到 aarch64 的 jdk+fx，可改用手动安装（取消下面注释）：
-        #   Invoke-WebRequest https://download.bell-sw.com/java/25.0.4.1+1/bellsoft-jdk25.0.4.1+1-windows-aarch64-full.msi -OutFile bellsoft.msi
-        #   msiexec /i bellsoft.msi /quiet
         uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5.7.0
         with:
           java-version: '25'
@@ -77,18 +73,59 @@ jobs:
       - name: Maven version (debug)
         run: mvn -v
 
+      # ★ 把 JavaFX 装进本地 Maven 仓库（解决 Central 无 windows-arm64 工件的问题）
+      #   - 第 1 步：安装 Liberica JDK 自带的 javafx jar（含 arm64 原生库）。
+      #   - 第 2 步：LibericaFX 在 WoA 不包含 Media/WebKit，故从 Central 拉 x64 的 win 版
+      #             转存成 windows-arm64 兜底。pdfsam 是 PDF 工具、不调用 JavaFX Media，
+      #             因此构建通过、运行也正常；media 在 arm64 上不可用属已知限制。
+      #   注意：mvn 的 -D 参数带点（如 -DgroupId=org.openjfx、-Djavafx.platform=...）在
+      #   PowerShell 下调 mvn.cmd 会被按点拆坏；故全程用 --% 停止解析，变量改用 %ENV% 中转。
+      - name: Install JavaFX (Windows ARM64) into local Maven repo
+        shell: pwsh
+        run: |
+          $env:FXVER = "25.0.4"
+          $env:FXCLS = "windows-arm64"
+
+          # 1) Liberica jdk+fx 自带的 javafx jar（位于 $JAVA_HOME 下，含 arm64 natives）
+          $fxJars = Get-ChildItem -Path $env:JAVA_HOME -Recurse -Filter 'javafx-*.jar' -ErrorAction SilentlyContinue |
+                    Where-Object { $_.Name -match '^javafx-(base|controls|fxml|graphics|media|swing|web)\.jar$' }
+          foreach ($j in $fxJars) {
+            $env:FXFILE = $j.FullName
+            $env:FXMOD = $j.Name -replace '^javafx-','' -replace '\.jar$',''
+            mvn --% -B install:install-file -Dfile=%FXFILE% -DgroupId=org.openjfx -DartifactId=javafx-%FXMOD% -Dversion=%FXVER% -Dclassifier=%FXCLS% -Dpackaging=jar
+          }
+
+          # 2) 兜底：Liberica 在 WoA 未提供的模块（media/web），从 Central 取 x64 win 版转存
+          foreach ($mod in @('media','web')) {
+            $local = "$env:USERPROFILE\.m2\repository\org\openjfx\javafx-$mod\$env:FXVER\javafx-$mod-$env:FXVER-$env:FXCLS.jar"
+            if (-not (Test-Path $local)) {
+              $env:FXMOD = $mod
+              mvn --% -B dependency:get -Dartifact=org.openjfx:javafx-%FXMOD%:%FXVER%:win
+              $winJar = "$env:USERPROFILE\.m2\repository\org\openjfx\javafx-$mod\$env:FXVER\javafx-$mod-$env:FXVER-win.jar"
+              if (Test-Path $winJar) {
+                $env:FXFILE = $winJar
+                mvn --% -B install:install-file -Dfile=%FXFILE% -DgroupId=org.openjfx -DartifactId=javafx-%FXMOD% -Dversion=%FXVER% -Dclassifier=%FXCLS% -Dpackaging=jar
+              } else {
+                Write-Warning "javafx-$mod not available; media/web features may be unavailable on WoA"
+              }
+            }
+          }
+
+          # 3) 确认本地已就位
+          Get-ChildItem "$env:USERPROFILE\.m2\repository\org\openjfx" -Recurse -Filter "*$env:FXCLS*.jar" | Select-Object FullName
+
       - name: Build with Maven
-        # 跳过 TestFX UI 测试：无显示的 headless ARM runner 无法启动 JavaFX 界面，故无需 -Djava.awt.headless。
-        # 注意：PowerShell 下带点的 -D 参数（如 -Djava.awt.headless=true）会被错误分词，
-        # 导致 Maven 把 ".awt.headless=true" 当成生命周期阶段而报 "Unknown lifecycle phase"。需要时用引号包住或加 --% 停止解析。
-        run: mvn -B -DskipTests -Djavafx.platform=windows-arm64 verify
+        # --% 让 -Djavafx.platform=windows-arm64 原样传给 mvn（避免 PowerShell 按点拆坏）。
+        # 该属性使 pdfsam 用上面装好的本地 arm64 工件解析 OpenJFX。
+        # 跳过 TestFX UI 测试：无显示的 headless ARM runner 无法启动 JavaFX 界面。
+        run: mvn --% -B -DskipTests -Djavafx.platform=windows-arm64 verify
 
       # ---- 可选：产出真正的 ARM64 安装包（jlink + jpackage） -----------------
       # pdfsam 的 -Drelease profile 会用 jlink 打出自包含运行时并 jpackage 成安装包。
       # 注意：jpackage 在 Windows 上通常依赖 WiX（或 Inno Setup）；若 runner 缺失，
       # 先 scoop install wixtoolset（或自行安装），再取消下面这一步的注释。
       # - name: Package release (optional, produces installer)
-      #   run: mvn -B -DskipTests -Drelease verify
+      #   run: mvn --% -B -DskipTests -Djavafx.platform=windows-arm64 -Drelease verify
       # ----------------------------------------------------------------------
 
       - name: List build output (debug, helps locate the installer)
@@ -104,7 +141,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: pdfsam-windows-arm64
-          # 宽泛匹配：verify 产出 JAR，若加了 -Drelease 还会出现 assembled/ 与 zip 包
           path: |
             pdfsam-basic/target/*.exe
             pdfsam-basic/target/*.msi
