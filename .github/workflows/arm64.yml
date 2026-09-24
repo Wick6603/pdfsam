@@ -43,7 +43,8 @@ jobs:
 
       - name: Show target SHA (debug)
         shell: pwsh
-        run: 'echo "Building SHA: ${{ inputs.sha }}"'   # ✅
+        run: 'echo "Building SHA: ${{ inputs.sha }}"'
+
       - name: Show runner / Java arch (debug)
         shell: pwsh
         run: |
@@ -77,16 +78,17 @@ jobs:
         run: mvn -v
 
       - name: Build with Maven
-        # 跳过 TestFX UI 测试：无显示的 headless ARM runner 无法启动 JavaFX 界面。
-        # 想跑测试时去掉 -DskipTests（需有显示器或配置虚拟显示）。
-        run: mvn -B -DskipTests -Djava.awt.headless=true verify
+        # 跳过 TestFX UI 测试：无显示的 headless ARM runner 无法启动 JavaFX 界面，故无需 -Djava.awt.headless。
+        # 注意：PowerShell 下带点的 -D 参数（如 -Djava.awt.headless=true）会被错误分词，
+        # 导致 Maven 把 ".awt.headless=true" 当成生命周期阶段而报 "Unknown lifecycle phase"。需要时用引号包住或加 --% 停止解析。
+        run: mvn -B -DskipTests verify
 
       # ---- 可选：产出真正的 ARM64 安装包（jlink + jpackage） -----------------
       # pdfsam 的 -Drelease profile 会用 jlink 打出自包含运行时并 jpackage 成安装包。
       # 注意：jpackage 在 Windows 上通常依赖 WiX（或 Inno Setup）；若 runner 缺失，
       # 先 scoop install wixtoolset（或自行安装），再取消下面这一步的注释。
       # - name: Package release (optional, produces installer)
-      #   run: mvn -B -DskipTests -Djava.awt.headless=true -Drelease verify
+      #   run: mvn -B -DskipTests -Drelease verify
       # ----------------------------------------------------------------------
 
       - name: List build output (debug, helps locate the installer)
