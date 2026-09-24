@@ -1,0 +1,106 @@
+# =============================================================================
+# 在 Windows on ARM (windows-11-arm) 上原生构建 PDFsam Basic
+#
+# 策略（路径 B）：使用 BellSoft Liberica 的 "jdk+fx"（即 Full）构建，
+# 它已经内嵌了面向 Windows AArch64 的 LibericaFX（基于 OpenJFX）。
+# 这样可以绕过 "Maven Central 的 org.openjfx 没有 windows-aarch64 分类器"
+# 这一根本障碍——JavaFX 直接来自 JDK 自带的 jmods，而不是去中央仓库拉工件。
+#
+# 参考：pdfsam 原仓库 .github/workflows/build.yml（同样用 liberica + jdk+fx）
+# Runner 标签来源：GitHub 官方文档 "GitHub-hosted runners" 参考表
+#   - windows-11-arm          （arm64 / Windows 11，公共仓库免费；私有走 arm64 standard runner）
+#   - windows-11-vs2026-arm   （同上，但预装 Visual Studio，适合"路径 A 从源码编译 OpenJFX"）
+#
+# 关于 gettext：pdfsam 仅"构建期"需要它（gettext-maven-plugin 调 msgfmt 把
+#   pdfsam-i18n/po/*.po 编译成 Java Messages_*.properties 打进 JAR），运行期
+#   通过标准 Java ResourceBundle 读取，不依赖 gettext 二进制。mlocati 的预编译包
+#   只有 x86/x64，故下面 scoop 装的是 x64 版、靠 ARM64 上的 x64 模拟运行，构建足够。
+#   （若要原生 arm64 gettext，改用：vcpkg install gettext --triplet arm64-windows）
+# =============================================================================
+name: build-windows-arm64
+
+on:
+  push:
+    branches: [ master ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows-arm64:
+    name: build on windows-11-arm
+    runs-on: windows-11-arm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Show runner / Java arch (debug)
+        shell: pwsh
+        run: |
+          echo "RUNNER_OS   = $env:RUNNER_OS"
+          echo "RUNNER_ARCH = $env:RUNNER_ARCH"
+          java -version
+          # 确认拿到的是 aarch64 的 JDK（应显示 os.arch = aarch64 / vendor = BellSoft）
+          java -XshowSettings:properties -version 2>&1 | Select-String -Pattern 'os.arch|java.vm.vendor'
+
+      - name: Set up JDK 25 (Liberica Full with JavaFX) for Windows ARM64
+        # 关键：distribution=liberica + java-package=jdk+fx 会让 setup-java
+        # 拉取 windows-aarch64 的 Full 构建，其中已含 javafx.* 模块（LibericaFX）。
+        # 若 setup-java 报找不到 aarch64 的 jdk+fx，可改用手动安装（取消下面注释）：
+        #   Invoke-WebRequest https://download.bell-sw.com/java/25.0.4.1+1/bellsoft-jdk25.0.4.1+1-windows-aarch64-full.msi -OutFile bellsoft.msi
+        #   msiexec /i bellsoft.msi /quiet
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5.7.0
+        with:
+          java-version: '25'
+          distribution: 'liberica'
+          java-package: 'jdk+fx'
+          cache: 'maven'
+
+      # 安装 gettext + maven（均走 scoop；x64 版在 ARM64 上靠模拟运行，构建足够）
+      - name: Install scoop packages (gettext, maven)
+        uses: MinoruSekine/setup-scoop@371e1c778465fed5ee2101c415bead47553e1a07 # v5.0.0
+
+      - name: Install gettext and maven
+        run: scoop install gettext maven
+
+      - name: Maven version (debug)
+        run: mvn -v
+
+      - name: Build with Maven
+        # 跳过 TestFX UI 测试：无显示的 headless ARM runner 无法启动 JavaFX 界面。
+        # 想跑测试时去掉 -DskipTests（需有显示器或配置虚拟显示）。
+        run: mvn -B -DskipTests -Djava.awt.headless=true verify
+
+      # ---- 可选：产出真正的 ARM64 安装包（jlink + jpackage） -----------------
+      # pdfsam 的 -Drelease profile 会用 jlink 打出自包含运行时并 jpackage 成安装包。
+      # 注意：jpackage 在 Windows 上通常依赖 WiX（或 Inno Setup）；若 runner 缺失，
+      # 先 scoop install wixtoolset（或自行安装），再取消下面这一步的注释。
+      # - name: Package release (optional, produces installer)
+      #   run: mvn -B -DskipTests -Djava.awt.headless=true -Drelease verify
+      # ----------------------------------------------------------------------
+
+      - name: List build output (debug, helps locate the installer)
+        if: always()
+        shell: pwsh
+        run: |
+          Get-ChildItem -Path . -Recurse -Include *.exe,*.msi,*.zip |
+            Where-Object { $_.FullName -match 'target' } |
+            Select-Object FullName,Length
+
+      - name: Upload Windows ARM64 artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pdfsam-windows-arm64
+          # 宽泛匹配：verify 产出 JAR，若加了 -Drelease 还会出现 assembled/ 与 zip 包
+          path: |
+            pdfsam-basic/target/*.exe
+            pdfsam-basic/target/*.msi
+            pdfsam-basic/target/*.zip
+            pdfsam-basic/target/assembled/**
+            pdfsam-basic/target/**/*.exe
+            pdfsam-basic/target/**/*.msi
+          if-no-files-found: warn
